@@ -510,6 +510,38 @@ class WorkdayScraper:
                 logger.info("Auth succeeded, continuing to form extraction (Branch C)")
                 diagnostics["auth_flow"] = account_action.action
 
+                # Post-creation sign-in: some tenants (e.g. NVIDIA) redirect
+                # back to the sign-in page after account creation instead of
+                # auto-logging in.  Detect this and sign in with the freshly
+                # created credentials before proceeding.
+                if account_action.action == "created":
+                    post_status = await self._detect_status(page, diagnostics)
+                    if post_status == "login_required":
+                        logger.info("Post-creation sign-in required — tenant did not auto-login")
+                        diagnostics["post_creation_signin"] = "attempting"
+                        if account_action.credentials is None:
+                            diagnostics["post_creation_signin"] = "no_credentials"
+                            logger.error("Post-creation sign-in: no credentials available")
+                            schema = FormSchema(
+                                status="account_creation_failed", job=job, diagnostics=diagnostics
+                            )
+                            await self._dump_diagnostics(page, schema, url)
+                            return schema, account_action
+                        signin_status, _ = await self._sign_in(
+                            page, account_action.credentials, tenant, diagnostics
+                        )
+                        if signin_status != "ok":
+                            diagnostics["post_creation_signin"] = "failed"
+                            logger.error("Post-creation sign-in failed with status=%s", signin_status)
+                            await self._dump_auth_diagnostics(page, diagnostics, "post_create_signin_failed")
+                            schema = FormSchema(
+                                status="account_creation_failed", job=job, diagnostics=diagnostics
+                            )
+                            await self._dump_diagnostics(page, schema, url)
+                            return schema, account_action
+                        diagnostics["post_creation_signin"] = "success"
+                        logger.info("Post-creation sign-in succeeded")
+
                 # Re-extract job context after auth navigation
                 job = await self._extract_job_context(page, url, diagnostics)
 
@@ -555,6 +587,36 @@ class WorkdayScraper:
                     # Auth succeeded — continue to form extraction
                     logger.info("Auth succeeded post-apply, continuing (Branch C)")
                     diagnostics["auth_flow"] = account_action.action
+
+                    # Post-creation sign-in (same check as pre-apply path)
+                    if account_action.action == "created":
+                        post_status = await self._detect_status(page, diagnostics)
+                        if post_status == "login_required":
+                            logger.info("Post-creation sign-in required (post-apply)")
+                            diagnostics["post_creation_signin"] = "attempting"
+                            if account_action.credentials is None:
+                                diagnostics["post_creation_signin"] = "no_credentials"
+                                logger.error("Post-creation sign-in: no credentials available")
+                                schema = FormSchema(
+                                    status="account_creation_failed", job=job, diagnostics=diagnostics
+                                )
+                                await self._dump_diagnostics(page, schema, url)
+                                return schema, account_action
+                            signin_status, _ = await self._sign_in(
+                                page, account_action.credentials, tenant, diagnostics
+                            )
+                            if signin_status != "ok":
+                                diagnostics["post_creation_signin"] = "failed"
+                                logger.error("Post-creation sign-in failed (post-apply)")
+                                await self._dump_auth_diagnostics(page, diagnostics, "post_create_signin_failed")
+                                schema = FormSchema(
+                                    status="account_creation_failed", job=job, diagnostics=diagnostics
+                                )
+                                await self._dump_diagnostics(page, schema, url)
+                                return schema, account_action
+                            diagnostics["post_creation_signin"] = "success"
+                            logger.info("Post-creation sign-in succeeded (post-apply)")
+
                     job = await self._extract_job_context(page, url, diagnostics)
 
                 elif status != "ok":
