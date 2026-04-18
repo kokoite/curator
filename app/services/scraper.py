@@ -10,12 +10,18 @@ from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
+import logging
+
 from app.models.schemas import (
+    AccountAction,
+    Credentials,
     FieldOption,
     FormField,
     FormSchema,
     JobContext,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Pattern-based automation-id detection (regex, never hardcoded exact IDs)
@@ -25,6 +31,7 @@ _AID_APPLY_MANUALLY = r"applyManually|manualApplication"
 _AID_JOB_HEADER = r"jobPostingHeader|jobTitle"
 _AID_JOB_DESCRIPTION = r"jobPostingDescription|jobDescription"
 _AID_STEP_INDICATOR = r"progressBar|stepIndicator|wizardStep"
+_AID_CREATE_ACCOUNT = r"createAccount|newUser|signUp|registerButton"
 
 # Login wall signals — need ≥2 to confirm
 _LOGIN_SIGNALS = [
@@ -345,6 +352,54 @@ _FIELD_EXTRACTION_JS = """
 _IST = timedelta(hours=5, minutes=30)
 
 
+class _AccountProfile:
+    """Thin wrapper that adds a ``password`` attribute to a UserProfile.
+
+    The matcher uses ``getattr(profile, key)`` for value resolution.
+    ACCOUNT_RULES map password/confirm-password fields to the key ``"password"``.
+    This wrapper makes ``getattr(account_profile, "password")`` return the
+    generated password, while all other attribute lookups delegate to the
+    underlying real profile.
+    """
+
+    def __init__(self, profile, password: str) -> None:
+        self._profile = profile
+        self.password = password
+
+    def __getattr__(self, name: str):
+        return getattr(self._profile, name)
+
+
+def extract_tenant(url: str) -> str | None:
+    """Extract the tenant host from a URL.
+
+    Returns the full host portion of the URL (e.g. "nvidia.wd5.myworkdayjobs.com").
+    The tenant string is the credential lookup key.
+    """
+    m = re.match(r"https?://([^/]+)", url)
+    return m.group(1) if m else None
+
+
+# Signals for invalid credentials after sign-in attempt
+_INVALID_CRED_SIGNALS = [
+    "incorrect",
+    "invalid",
+    "not found",
+    "wrong password",
+    "authentication failed",
+    "does not match",
+]
+
+# Signals for email verification required after account creation
+_VERIFICATION_SIGNALS = [
+    "verify your email",
+    "verification email",
+    "check your email",
+    "confirm your email",
+    "email has been sent",
+]
+
+
 class WorkdayScraper:
     """Singleton Playwright scraper with start/stop lifecycle."""
 
@@ -366,12 +421,21 @@ class WorkdayScraper:
             await self._pw.stop()
             self._pw = None
 
-    async def scrape(self, url: str) -> FormSchema:
-        """Scrape a Workday job URL and return a FormSchema."""
+    async def scrape(
+        self, url: str, known_credentials: Credentials | None = None
+    ) -> tuple[FormSchema, AccountAction]:
+        """Scrape a Workday job URL and return a FormSchema + AccountAction.
+
+        When the page requires login:
+          - If known_credentials are provided, attempt sign-in (Branch A).
+          - Otherwise, attempt account creation (Branch B).
+          - On auth success, continue to normal form extraction (Branch C).
+        """
         from app.config import settings
 
         diagnostics: dict[str, str] = {}
         job = JobContext(url=url)
+        account_action = AccountAction(action="none")
 
         if not self._browser:
             raise RuntimeError("Scraper not started — call start() first")
@@ -394,14 +458,41 @@ class WorkdayScraper:
                     status="job_closed", job=job, diagnostics=diagnostics
                 )
                 await self._dump_diagnostics(page, schema, url)
-                return schema
+                return schema, account_action
 
             if status == "login_required":
-                schema = FormSchema(
-                    status="login_required", job=job, diagnostics=diagnostics
-                )
-                await self._dump_diagnostics(page, schema, url)
-                return schema
+                tenant = extract_tenant(url)
+                logger.info("Login wall detected for tenant=%s", tenant)
+
+                if known_credentials is not None:
+                    # Branch A: Sign-in with provided credentials
+                    logger.info("Attempting sign-in flow (Branch A)")
+                    auth_status, account_action = await self._sign_in(
+                        page, known_credentials, tenant, diagnostics
+                    )
+                else:
+                    # Branch B: Account creation
+                    logger.info("Attempting account-creation flow (Branch B)")
+                    auth_status, account_action = await self._create_account(
+                        page, tenant, diagnostics
+                    )
+
+                if auth_status != "ok":
+                    schema = FormSchema(
+                        status=auth_status, job=job, diagnostics=diagnostics
+                    )
+                    await self._dump_diagnostics(page, schema, url)
+                    return schema, account_action
+
+                # Branch C: Auth succeeded — continue to form extraction
+                logger.info("Auth succeeded, continuing to form extraction (Branch C)")
+                diagnostics["auth_flow"] = account_action.action
+
+                # Re-extract job context after auth navigation
+                job = await self._extract_job_context(page, url, diagnostics)
+
+                # Try to click Apply after auth
+                await self._click_apply(page, diagnostics)
 
             # 4. Try to click Apply → Apply Manually if on job posting page
             await self._click_apply(page, diagnostics)
@@ -413,20 +504,49 @@ class WorkdayScraper:
                 )
                 diagnostics["form_readiness"] = "fields detected"
             except Exception:
-                # Re-check terminal states after apply click
+                # Re-check terminal states after apply click — the login
+                # wall often only appears AFTER clicking Apply.
                 status = await self._detect_status(page, diagnostics)
-                if status != "ok":
+
+                if status == "login_required":
+                    tenant = extract_tenant(url)
+                    logger.info("Login wall detected post-apply for tenant=%s", tenant)
+
+                    if known_credentials is not None:
+                        logger.info("Attempting sign-in flow (Branch A, post-apply)")
+                        auth_status, account_action = await self._sign_in(
+                            page, known_credentials, tenant, diagnostics
+                        )
+                    else:
+                        logger.info("Attempting account-creation flow (Branch B, post-apply)")
+                        auth_status, account_action = await self._create_account(
+                            page, tenant, diagnostics
+                        )
+
+                    if auth_status != "ok":
+                        schema = FormSchema(
+                            status=auth_status, job=job, diagnostics=diagnostics
+                        )
+                        await self._dump_diagnostics(page, schema, url)
+                        return schema, account_action
+
+                    # Auth succeeded — continue to form extraction
+                    logger.info("Auth succeeded post-apply, continuing (Branch C)")
+                    diagnostics["auth_flow"] = account_action.action
+                    job = await self._extract_job_context(page, url, diagnostics)
+
+                elif status != "ok":
                     schema = FormSchema(
                         status=status, job=job, diagnostics=diagnostics
                     )
                     await self._dump_diagnostics(page, schema, url)
-                    return schema
-
-                schema = FormSchema(
-                    status="no_form_found", job=job, diagnostics=diagnostics
-                )
-                await self._dump_diagnostics(page, schema, url)
-                return schema
+                    return schema, account_action
+                else:
+                    schema = FormSchema(
+                        status="no_form_found", job=job, diagnostics=diagnostics
+                    )
+                    await self._dump_diagnostics(page, schema, url)
+                    return schema, account_action
 
             # 6. Extract fields via in-browser JS
             raw_fields = await page.evaluate(_FIELD_EXTRACTION_JS)
@@ -438,7 +558,7 @@ class WorkdayScraper:
                     status="no_form_found", job=job, diagnostics=diagnostics
                 )
                 await self._dump_diagnostics(page, schema, url)
-                return schema
+                return schema, account_action
 
             # 7. Extract step indicator
             current_step, total_steps = await self._extract_step_indicator(
@@ -452,7 +572,7 @@ class WorkdayScraper:
                 current_step=current_step,
                 total_steps=total_steps,
                 diagnostics=diagnostics,
-            )
+            ), account_action
 
         except Exception as e:
             diagnostics["error"] = str(e)[:500]
@@ -460,10 +580,495 @@ class WorkdayScraper:
                 status="unsupported_flow", job=job, diagnostics=diagnostics
             )
             await self._dump_diagnostics(page, schema, url)
-            return schema
+            return schema, account_action
 
         finally:
             await context.close()
+
+    # -----------------------------------------------------------------------
+    # Auth flow helpers (Branches A, B, C)
+    # -----------------------------------------------------------------------
+
+    async def _sign_in(
+        self,
+        page: Page,
+        credentials: Credentials,
+        tenant: str | None,
+        diagnostics: dict[str, str],
+    ) -> tuple[str, AccountAction]:
+        """Branch A: Sign in with known credentials.
+
+        Returns (status, AccountAction) where status is "ok" on success or an
+        error ScrapeStatus literal on failure.
+        """
+        logger.info("Sign-in flow: looking for sign-in form")
+        diagnostics["auth_branch"] = "sign_in"
+
+        try:
+            # Look for a "Sign In" button/link to navigate to the sign-in form
+            sign_in_btn = page.get_by_role(
+                "button", name=re.compile(r"sign\s*in", re.IGNORECASE)
+            )
+            if await sign_in_btn.count() > 0:
+                await sign_in_btn.first.click()
+                await page.wait_for_load_state("networkidle")
+                logger.info("Sign-in flow: clicked Sign In button")
+            else:
+                # Try link
+                sign_in_link = page.get_by_role(
+                    "link", name=re.compile(r"sign\s*in", re.IGNORECASE)
+                )
+                if await sign_in_link.count() > 0:
+                    await sign_in_link.first.click()
+                    await page.wait_for_load_state("networkidle")
+                    logger.info("Sign-in flow: clicked Sign In link")
+
+            # Fill email field
+            email_input = page.locator(
+                'input[type="email"], input[name*="email" i], '
+                'input[autocomplete="email"], input[data-automation-id*="email" i]'
+            )
+            if await email_input.count() > 0:
+                await email_input.first.fill(credentials.email)
+                logger.info("Sign-in flow: filled email")
+            else:
+                diagnostics["sign_in_error"] = "email input not found"
+                logger.warning("Sign-in flow: email input not found")
+                await self._dump_auth_diagnostics(page, diagnostics, "sign_in_no_email")
+                return "invalid_credentials", AccountAction(action="none")
+
+            # Fill password field
+            password_input = page.locator('input[type="password"]')
+            if await password_input.count() > 0:
+                await password_input.first.fill(credentials.password)
+                logger.info("Sign-in flow: filled password")
+            else:
+                diagnostics["sign_in_error"] = "password input not found"
+                logger.warning("Sign-in flow: password input not found")
+                await self._dump_auth_diagnostics(page, diagnostics, "sign_in_no_password")
+                return "invalid_credentials", AccountAction(action="none")
+
+            # Click submit (force=True: Workday click_filter overlay)
+            submit_btn = page.locator(
+                'button[type="submit"], '
+                'button:has-text("Sign In"), button:has-text("Log In")'
+            )
+            if await submit_btn.count() > 0:
+                await submit_btn.first.click(force=True)
+            else:
+                # Try pressing Enter as fallback
+                await password_input.first.press("Enter")
+
+            await page.wait_for_load_state("networkidle")
+            logger.info("Sign-in flow: submitted credentials")
+
+            # Check for invalid credential signals
+            try:
+                page_text = (await page.inner_text("body")).lower()
+            except Exception:
+                page_text = ""
+
+            for signal in _INVALID_CRED_SIGNALS:
+                if signal in page_text:
+                    diagnostics["sign_in_error"] = f"invalid_creds_signal: {signal}"
+                    logger.warning("Sign-in flow: invalid credentials detected (%s)", signal)
+                    await self._dump_auth_diagnostics(page, diagnostics, "sign_in_invalid")
+                    return "invalid_credentials", AccountAction(action="none")
+
+            # Success
+            logger.info("Sign-in flow: signed in successfully")
+            diagnostics["sign_in_result"] = "success"
+            return "ok", AccountAction(
+                action="signed_in",
+                tenant=tenant,
+                credentials=None,
+            )
+
+        except Exception as e:
+            diagnostics["sign_in_error"] = str(e)[:500]
+            logger.error("Sign-in flow failed: %s", e)
+            await self._dump_auth_diagnostics(page, diagnostics, "sign_in_error")
+            return "invalid_credentials", AccountAction(action="none")
+
+    async def _create_account(
+        self,
+        page: Page,
+        tenant: str | None,
+        diagnostics: dict[str, str],
+    ) -> tuple[str, AccountAction]:
+        """Branch B: Create a new Workday Candidate Home account.
+
+        1. Find and click "Create Account" / "New User" (automation-id + text).
+        2. Extract the creation form fields via _FIELD_EXTRACTION_JS.
+        3. Synthesize a profile with a ``password`` attribute.
+        4. Run the full fill pipeline (matcher → classifier → generator).
+        5. Apply fill results to the page and submit.
+        6. Inspect post-submit state.
+
+        Returns (status, AccountAction) where status is "ok" on success or an
+        error ScrapeStatus literal on failure.
+        """
+        from app.fixtures.dummy_profile import DUMMY_PROFILE
+        from app.services.filler import fill_form
+        from app.services.password import generate_password
+
+        logger.info("Account-creation flow: looking for create-account trigger")
+        diagnostics["auth_branch"] = "create_account"
+
+        try:
+            # ── Step 1: Click through to the creation form ──────────────
+            clicked = await self._click_create_account(page, diagnostics)
+            if not clicked:
+                diagnostics["create_account_error"] = "no create-account trigger found"
+                logger.warning("Account-creation flow: no create-account trigger found")
+                await self._dump_auth_diagnostics(page, diagnostics, "create_no_button")
+                return "account_creation_failed", AccountAction(action="none")
+
+            # ── Step 2: Extract creation form fields ────────────────────
+            from app.config import settings
+
+            try:
+                await page.wait_for_function(
+                    _FORM_READINESS_JS, timeout=settings.page_timeout_ms
+                )
+            except Exception:
+                diagnostics["create_account_error"] = "creation form not ready"
+                logger.warning("Account-creation flow: form fields never appeared")
+                await self._dump_auth_diagnostics(page, diagnostics, "create_no_form")
+                return "account_creation_failed", AccountAction(action="none")
+
+            raw_fields = await page.evaluate(_FIELD_EXTRACTION_JS)
+            fields = [FormField(**f) for f in raw_fields]
+            diagnostics["create_form_field_count"] = str(len(fields))
+            logger.info("Account-creation flow: extracted %d form fields", len(fields))
+
+            if not fields:
+                diagnostics["create_account_error"] = "no fields in creation form"
+                await self._dump_auth_diagnostics(page, diagnostics, "create_empty_form")
+                return "account_creation_failed", AccountAction(action="none")
+
+            # ── Step 3: Generate password and build synthetic profile ───
+            password = generate_password()
+
+            # _AccountProfile delegates attribute lookups to DUMMY_PROFILE
+            # and adds a synthetic "password" attribute so the matcher's
+            # ACCOUNT_RULES can resolve password fields via getattr.
+            account_profile = _AccountProfile(DUMMY_PROFILE, password)
+
+            # Build a FormSchema so fill_form can consume it
+            create_schema = FormSchema(
+                status="ok",
+                job=JobContext(url=""),
+                fields=fields,
+                diagnostics={},
+            )
+
+            # ── Step 4: Run the full fill pipeline ─────────────────────
+            filled, unfilled = await fill_form(create_schema, account_profile)
+            diagnostics["create_form_filled_count"] = str(len(filled))
+            diagnostics["create_form_unfilled_count"] = str(len(unfilled))
+            logger.info(
+                "Account-creation flow: fill pipeline returned %d filled, %d unfilled",
+                len(filled), len(unfilled),
+            )
+
+            # ── Step 5: Apply fill results to the page ─────────────────
+            applied = await self._apply_fill_results(page, filled, diagnostics)
+            diagnostics["create_form_applied_count"] = str(applied)
+            logger.info("Account-creation flow: applied %d fields to page", applied)
+
+            # ── Step 6: Submit the form ────────────────────────────────
+            # Workday wraps buttons with click_filter overlay divs that
+            # intercept pointer events — use force=True to click through.
+            submit_btn = page.locator(
+                'button[type="submit"], '
+                'button:has-text("Create Account"), button:has-text("Sign Up"), '
+                'button:has-text("Register")'
+            )
+            if await submit_btn.count() > 0:
+                await submit_btn.first.click(force=True)
+            else:
+                pw_inputs = page.locator('input[type="password"]')
+                if await pw_inputs.count() > 0:
+                    await pw_inputs.last.press("Enter")
+
+            await page.wait_for_load_state("networkidle")
+            logger.info("Account-creation flow: submitted account form")
+
+            # ── Step 7: Inspect post-submit state ──────────────────────
+            try:
+                page_text = (await page.inner_text("body")).lower()
+            except Exception:
+                page_text = ""
+
+            # 7a. Email verification required
+            for signal in _VERIFICATION_SIGNALS:
+                if signal in page_text:
+                    diagnostics["create_account_result"] = "email_verification_required"
+                    logger.info("Account-creation flow: email verification required")
+
+                    now = datetime.now(timezone(_IST))
+                    creds = Credentials(
+                        tenant=tenant or "",
+                        email=DUMMY_PROFILE.email,
+                        password=password,
+                        created_at=now,
+                        verified=False,
+                        source="created",
+                    )
+                    from app.fixtures.dummy_credentials import save_dummy_credentials
+                    save_dummy_credentials(creds)
+
+                    return "email_verification_required", AccountAction(
+                        action="verification_pending",
+                        tenant=tenant,
+                        credentials=creds,
+                    )
+
+            # 7b. Captcha / rate-limit / required-field / other failures
+            _FAILURE_SIGNALS = [
+                "already exists",
+                "already registered",
+                "account already",
+                "error creating",
+                "captcha",
+                "rate limit",
+                "too many requests",
+                "required field",
+                "this field is required",
+                "please complete",
+            ]
+            for signal in _FAILURE_SIGNALS:
+                if signal in page_text:
+                    diagnostics["create_account_error"] = f"failure_signal: {signal}"
+                    logger.warning("Account-creation flow: failed (%s)", signal)
+                    await self._dump_auth_diagnostics(page, diagnostics, "create_failed")
+                    return "account_creation_failed", AccountAction(action="none")
+
+            # 7c. Success — account created and logged in
+            logger.info("Account-creation flow: account created successfully")
+            diagnostics["create_account_result"] = "success"
+
+            now = datetime.now(timezone(_IST))
+            creds = Credentials(
+                tenant=tenant or "",
+                email=DUMMY_PROFILE.email,
+                password=password,
+                created_at=now,
+                verified=True,
+                source="created",
+            )
+            from app.fixtures.dummy_credentials import save_dummy_credentials
+            save_dummy_credentials(creds)
+
+            return "ok", AccountAction(
+                action="created",
+                tenant=tenant,
+                credentials=creds,
+            )
+
+        except Exception as e:
+            diagnostics["create_account_error"] = str(e)[:500]
+            logger.error("Account-creation flow failed: %s", e)
+            await self._dump_auth_diagnostics(page, diagnostics, "create_error")
+            return "account_creation_failed", AccountAction(action="none")
+
+    async def _click_create_account(
+        self, page: Page, diagnostics: dict[str, str]
+    ) -> bool:
+        """Find and click the Create Account / New User trigger.
+
+        Tries automation-id pattern first, then text-based matching on buttons
+        and links. Returns True if a trigger was found and clicked.
+        """
+        # Strategy 1: automation-id regex
+        aid_el = await self._find_by_aid_pattern(page, _AID_CREATE_ACCOUNT)
+        if aid_el:
+            try:
+                await aid_el.click()
+                diagnostics["create_account_trigger"] = "automation-id"
+                await page.wait_for_load_state("networkidle")
+                logger.info("Account-creation flow: clicked trigger via automation-id")
+                return True
+            except Exception as e:
+                diagnostics["create_account_aid_error"] = str(e)[:200]
+
+        # Strategy 2: text-based button
+        _CREATE_TEXT_RE = re.compile(
+            r"create\s*account|new\s*user|sign\s*up", re.IGNORECASE
+        )
+        create_btn = page.get_by_role("button", name=_CREATE_TEXT_RE)
+        if await create_btn.count() > 0:
+            await create_btn.first.click()
+            diagnostics["create_account_trigger"] = "button-text"
+            await page.wait_for_load_state("networkidle")
+            logger.info("Account-creation flow: clicked Create Account button")
+            return True
+
+        # Strategy 3: text-based link
+        create_link = page.get_by_role("link", name=_CREATE_TEXT_RE)
+        if await create_link.count() > 0:
+            await create_link.first.click()
+            diagnostics["create_account_trigger"] = "link-text"
+            await page.wait_for_load_state("networkidle")
+            logger.info("Account-creation flow: clicked Create Account link")
+            return True
+
+        # Strategy 4: Workday email-first gateway — many tenants show
+        # "Sign in with email" first; the Create Account option only appears
+        # after entering an unrecognized email address.  Click the email
+        # sign-in button, enter the dummy email, submit, then re-check for
+        # a Create Account trigger.
+        email_btn = await self._find_by_aid_pattern(page, r"SignInWithEmailButton")
+        if not email_btn:
+            email_btn_loc = page.get_by_role(
+                "button", name=re.compile(r"sign\s*in\s*with\s*email", re.IGNORECASE)
+            )
+            if await email_btn_loc.count() > 0:
+                email_btn = email_btn_loc.first
+
+        if email_btn:
+            try:
+                await email_btn.click()
+                await page.wait_for_load_state("networkidle")
+                logger.info("Account-creation flow: clicked 'Sign in with email' gateway")
+                diagnostics["create_account_gateway"] = "sign-in-with-email"
+
+                # Enter the dummy email to discover the Create Account flow
+                from app.fixtures.dummy_profile import DUMMY_PROFILE
+
+                email_input = page.locator(
+                    'input[type="email"], input[type="text"][data-automation-id*="email" i], '
+                    'input[data-automation-id*="email" i]'
+                )
+                if await email_input.count() > 0:
+                    await email_input.first.fill(DUMMY_PROFILE.email)
+                    logger.info("Account-creation flow: entered email in gateway")
+
+                    # Submit the email (look for Continue / Submit / Sign In)
+                    submit = page.locator(
+                        'button[type="submit"], '
+                        'button[data-automation-id*="submit" i], '
+                        'button[data-automation-id*="signIn" i]'
+                    )
+                    if await submit.count() > 0:
+                        await submit.first.click(force=True)
+                    else:
+                        await email_input.first.press("Enter")
+
+                    await page.wait_for_load_state("networkidle")
+                    logger.info("Account-creation flow: submitted email in gateway")
+
+                    # Now re-check for Create Account trigger.
+                    # Use force=True because Workday's sign-in modal overlay
+                    # can intercept pointer events on the Create Account button.
+                    aid_el = await self._find_by_aid_pattern(page, _AID_CREATE_ACCOUNT)
+                    if aid_el:
+                        await aid_el.click(force=True)
+                        diagnostics["create_account_trigger"] = "email-gateway-then-aid"
+                        await page.wait_for_load_state("networkidle")
+                        return True
+
+                    create_btn = page.get_by_role("button", name=_CREATE_TEXT_RE)
+                    if await create_btn.count() > 0:
+                        await create_btn.first.click(force=True)
+                        diagnostics["create_account_trigger"] = "email-gateway-then-button"
+                        await page.wait_for_load_state("networkidle")
+                        return True
+
+                    create_link = page.get_by_role("link", name=_CREATE_TEXT_RE)
+                    if await create_link.count() > 0:
+                        await create_link.first.click(force=True)
+                        diagnostics["create_account_trigger"] = "email-gateway-then-link"
+                        await page.wait_for_load_state("networkidle")
+                        return True
+
+                    # The gateway may have landed directly on a creation form
+                    # (some tenants skip to account creation for unknown emails)
+                    pw_inputs = page.locator('input[type="password"]')
+                    if await pw_inputs.count() > 0:
+                        diagnostics["create_account_trigger"] = "email-gateway-direct-form"
+                        logger.info("Account-creation flow: gateway led directly to creation form")
+                        return True
+
+            except Exception as e:
+                diagnostics["create_account_gateway_error"] = str(e)[:200]
+                logger.warning("Account-creation flow: email gateway failed: %s", e)
+
+        return False
+
+    async def _apply_fill_results(
+        self,
+        page: Page,
+        filled: list,
+        diagnostics: dict[str, str],
+    ) -> int:
+        """Apply FilledField results to the live page via Playwright.
+
+        Returns the number of fields successfully applied.
+        """
+        applied = 0
+        for ff in filled:
+            try:
+                if ff.interaction == "type":
+                    await page.fill(ff.selector, str(ff.value))
+                elif ff.interaction == "select_native":
+                    await page.select_option(ff.selector, label=str(ff.value))
+                elif ff.interaction == "combobox":
+                    await page.click(ff.selector, force=True)
+                    await page.fill(ff.selector, str(ff.value))
+                    await page.wait_for_timeout(500)
+                    await page.keyboard.press("Enter")
+                elif ff.interaction == "radio" and ff.option_selector:
+                    await page.click(ff.option_selector, force=True)
+                elif ff.interaction == "checkbox":
+                    is_checked = await page.is_checked(ff.selector)
+                    should_check = ff.value is True or str(ff.value).lower() in (
+                        "true", "yes", "1"
+                    )
+                    if should_check != is_checked:
+                        await page.click(ff.selector, force=True)
+                else:
+                    # Fallback: try fill
+                    await page.fill(ff.selector, str(ff.value))
+
+                applied += 1
+                logger.debug("Applied field %s = %r", ff.label, ff.value)
+
+            except Exception as e:
+                logger.warning(
+                    "Account-creation flow: failed to apply field %s (%s): %s",
+                    ff.label, ff.selector, e,
+                )
+
+        return applied
+
+    async def _dump_auth_diagnostics(
+        self, page: Page, diagnostics: dict[str, str], label: str
+    ) -> None:
+        """Save HTML + screenshot for auth flow failures. Never throws."""
+        try:
+            dump_dir = "/tmp/workday-dumps"
+            os.makedirs(dump_dir, exist_ok=True)
+
+            now = datetime.now(timezone(_IST))
+            timestamp = now.strftime("%Y%m%d_%H%M%S")
+            base = f"{timestamp}_auth_{label}"
+
+            html_content = await page.content()
+            html_path = os.path.join(dump_dir, f"{base}.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+
+            png_path = os.path.join(dump_dir, f"{base}.png")
+            await page.screenshot(path=png_path, full_page=True)
+
+            diagnostics[f"auth_dump_html_{label}"] = html_path
+            diagnostics[f"auth_dump_screenshot_{label}"] = png_path
+            logger.info("Auth diagnostics dumped: %s", base)
+
+        except Exception as e:
+            diagnostics[f"auth_dump_error_{label}"] = str(e)[:200]
 
     # -----------------------------------------------------------------------
     # Internal helpers
