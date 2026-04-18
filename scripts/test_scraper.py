@@ -72,7 +72,7 @@ async def run(url: str, headless: bool) -> None:
 
     try:
         start = time.perf_counter()
-        schema = await scraper.scrape(url)
+        schema, _account_action = await scraper.scrape(url)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         print_schema(schema, elapsed_ms)
     finally:

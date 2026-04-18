@@ -48,6 +48,17 @@ YES_NO_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"over\s*(the\s*)?age\s*of\s*18"), "_age_over_18"),
 ]
 
+# ── Account-creation field rules ─────────────────────────────────────────
+# Password and confirm-password both map to "password" (same generated value).
+# The scraper synthesizes a UserProfile-like object with a `password` attribute
+# so these fields are resolved by the standard fill pipeline.
+ACCOUNT_RULES: list[tuple[re.Pattern[str], str | None, float]] = [
+    (re.compile(r"^password$"), "password", 0.98),
+    (re.compile(r"(confirm|verify|re-?enter)\s*password"), "password", 0.95),
+    (re.compile(r"create\s*password"), "password", 0.95),
+    (re.compile(r"security\s*question"), None, 0.0),  # flag for LLM or user
+]
+
 # Field types where the value must be selected from options.
 _OPTION_TYPES = {"select", "radio_group", "combobox"}
 
@@ -95,6 +106,23 @@ def match_field(field: FormField, profile: UserProfile) -> MatchResult | None:
                     needs_option_match=True,
                 )
 
+            return MatchResult(
+                profile_key=key,
+                value=value,
+                confidence=confidence,
+                needs_option_match=False,
+            )
+
+    # Try account-creation rules (password / security question).
+    # For password fields, the value is resolved from the profile's `password`
+    # attribute (set on the synthetic profile the scraper builds).
+    # For security questions (key=None), return a zero-confidence match so
+    # the caller escalates to LLM or flags for user input.
+    for pattern, key, confidence in ACCOUNT_RULES:
+        if pattern.search(label):
+            if key is None:
+                return None  # escalate to LLM
+            value = _resolve_value(profile, key)
             return MatchResult(
                 profile_key=key,
                 value=value,

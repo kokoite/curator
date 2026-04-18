@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 from typing import Literal
 
@@ -113,7 +114,31 @@ ScrapeStatus = Literal[
     "no_form_found",
     "job_closed",
     "unsupported_flow",
+    "account_created",
+    "signed_in",
+    "email_verification_required",
+    "invalid_credentials",
+    "account_creation_failed",
 ]
+
+
+class Credentials(BaseModel):
+    model_config = ConfigDict(strict=False)
+
+    tenant: str
+    email: str
+    password: str
+    created_at: datetime
+    verified: bool = True
+    source: Literal["created", "provided"] = "created"
+
+
+class AccountAction(BaseModel):
+    model_config = ConfigDict(strict=False)
+
+    action: Literal["none", "signed_in", "created", "verification_pending"] = "none"
+    tenant: str | None = None
+    credentials: Credentials | None = None
 
 
 class JobContext(BaseModel):
@@ -154,6 +179,7 @@ class FillRequest(BaseModel):
     model_config = ConfigDict(strict=False)
 
     url: str
+    known_credentials: Credentials | None = None
 
 
 class FillResponse(BaseModel):
@@ -163,3 +189,4 @@ class FillResponse(BaseModel):
     filled: list[FilledField] = Field(default_factory=list)
     unfilled: list[FormField] = Field(default_factory=list)
     elapsed_ms: int
+    account_action: AccountAction = Field(default_factory=lambda: AccountAction(action="none"))
