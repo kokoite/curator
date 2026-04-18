@@ -515,8 +515,7 @@ class WorkdayScraper:
                 # auto-logging in.  Detect this and sign in with the freshly
                 # created credentials before proceeding.
                 if account_action.action == "created":
-                    post_status = await self._detect_status(page, diagnostics)
-                    if post_status == "login_required":
+                    if await self._is_post_creation_signin(page):
                         logger.info("Post-creation sign-in required — tenant did not auto-login")
                         diagnostics["post_creation_signin"] = "attempting"
                         if account_action.credentials is None:
@@ -590,8 +589,7 @@ class WorkdayScraper:
 
                     # Post-creation sign-in (same check as pre-apply path)
                     if account_action.action == "created":
-                        post_status = await self._detect_status(page, diagnostics)
-                        if post_status == "login_required":
+                        if await self._is_post_creation_signin(page):
                             logger.info("Post-creation sign-in required (post-apply)")
                             diagnostics["post_creation_signin"] = "attempting"
                             if account_action.credentials is None:
@@ -1240,6 +1238,57 @@ class WorkdayScraper:
             return "login_required"
 
         return "ok"
+
+    async def _is_post_creation_signin(self, page: Page) -> bool:
+        """Narrow check for sign-in page after account creation.
+
+        Returns True only when ALL of the following hold:
+          1. At least one _LOGIN_SIGNALS text is present on the page.
+          2. A visible <input type="email"> (or email-like input) exists.
+          3. A visible <input type="password"> exists.
+
+        This is intentionally stricter than _detect_status (which uses ≥2
+        signals) — the two-input visibility requirement guards against
+        false positives from footer links or pagination controls.
+        """
+        _VIS_INPUT_JS = """
+        (selector) => {
+            const els = document.querySelectorAll(selector);
+            for (const el of els) {
+                if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') continue;
+                const cs = getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                if (parseFloat(cs.opacity) === 0) continue;
+                if (el.getAttribute('aria-hidden') === 'true') continue;
+                if (el.offsetWidth === 0 && el.offsetHeight === 0) continue;
+                return true;
+            }
+            return false;
+        }
+        """
+        try:
+            page_text = (await page.inner_text("body")).lower()
+        except Exception:
+            return False
+
+        # Condition 1: at least one login signal
+        if not any(s.lower() in page_text for s in _LOGIN_SIGNALS):
+            return False
+
+        # Condition 2: visible email input
+        has_email = await page.evaluate(
+            _VIS_INPUT_JS,
+            'input[type="email"], input[name*="email" i], '
+            'input[autocomplete="email"], input[data-automation-id*="email" i]',
+        )
+        if not has_email:
+            return False
+
+        # Condition 3: visible password input
+        has_password = await page.evaluate(
+            _VIS_INPUT_JS, 'input[type="password"]'
+        )
+        return has_password
 
     async def _click_apply(
         self, page: Page, diagnostics: dict[str, str]
