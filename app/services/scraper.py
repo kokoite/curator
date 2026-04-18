@@ -177,10 +177,24 @@ _FIELD_EXTRACTION_JS = """
     return typeMap[t] || ['text', 'type'];
   }
 
+  // --- Visibility check (honeypot filter) ---
+  function visible(el) {
+    if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none') return false;
+    if (cs.visibility === 'hidden') return false;
+    if (parseFloat(cs.opacity) === 0) return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    if (el.offsetWidth === 0 && el.offsetHeight === 0) return false;
+    if (el.offsetWidth <= 1 && el.offsetHeight <= 1 && cs.overflow !== 'visible') return false;
+    return true;
+  }
+
   // 1. Native inputs (excluding hidden/submit/button/radio)
   document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="radio"])').forEach(el => {
     const typeAttr = el.getAttribute('type') || 'text';
     if (typeAttr === 'checkbox') return; // handled separately
+    if (!visible(el)) return;
     const [fieldType, interaction] = mapInputType(typeAttr);
     const selector = resolveSelector(el);
     const label = resolveLabel(el);
@@ -200,6 +214,7 @@ _FIELD_EXTRACTION_JS = """
 
   // 2. Textareas
   document.querySelectorAll('textarea').forEach(el => {
+    if (!visible(el)) return;
     const selector = resolveSelector(el);
     const label = resolveLabel(el);
     addField({
@@ -218,6 +233,7 @@ _FIELD_EXTRACTION_JS = """
 
   // 3. Native <select>
   document.querySelectorAll('select').forEach(el => {
+    if (!visible(el)) return;
     const selector = resolveSelector(el);
     const label = resolveLabel(el);
     const options = Array.from(el.options).map(opt => ({
@@ -242,6 +258,7 @@ _FIELD_EXTRACTION_JS = """
   // 4. ARIA comboboxes
   document.querySelectorAll('[role="combobox"], button[aria-haspopup="listbox"], [aria-haspopup="listbox"]').forEach(el => {
     if (el.tagName.toLowerCase() === 'select') return; // already handled
+    if (!visible(el)) return;
     const selector = resolveSelector(el);
     const label = resolveLabel(el);
     addField({
@@ -266,9 +283,13 @@ _FIELD_EXTRACTION_JS = """
     radioGroups[name].push(el);
   });
   for (const [name, radios] of Object.entries(radioGroups)) {
+    // Filter out hidden individual radios
+    const visibleRadios = radios.filter(r => visible(r));
+    if (visibleRadios.length === 0) continue;
+
     // Group label from <legend>, [role="radiogroup"], or ancestor data-automation-id
     let groupLabel = '';
-    const firstRadio = radios[0];
+    const firstRadio = visibleRadios[0];
     const radiogroup = firstRadio.closest('[role="radiogroup"]');
     if (radiogroup) {
       const legend = radiogroup.querySelector('legend');
@@ -300,14 +321,14 @@ _FIELD_EXTRACTION_JS = """
     }
     if (!groupLabel) groupLabel = name;
 
-    const options = radios.map(r => ({
+    const options = visibleRadios.map(r => ({
       label: resolveLabel(r) || r.value || '',
       value: r.value || null,
       selector: resolveSelector(r),
     }));
 
     const groupSelector = radiogroup ? resolveSelector(radiogroup) : resolveSelector(firstRadio.closest('fieldset') || firstRadio);
-    const isRequired = radios.some(r => r.required || r.getAttribute('aria-required') === 'true');
+    const isRequired = visibleRadios.some(r => r.required || r.getAttribute('aria-required') === 'true');
 
     addField({
       field_id: nextId(),
@@ -325,6 +346,7 @@ _FIELD_EXTRACTION_JS = """
 
   // 6. Checkboxes (individual, not grouped)
   document.querySelectorAll('input[type="checkbox"]').forEach(el => {
+    if (!visible(el)) return;
     const selector = resolveSelector(el);
     const label = resolveLabel(el);
     addField({
